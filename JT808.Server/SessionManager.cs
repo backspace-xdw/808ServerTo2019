@@ -26,6 +26,11 @@ public class SessionInfo
     public string? IMEI { get; set; }
     public string? SoftwareVersion { get; set; }
     public string? TerminalModel { get; set; }
+
+    /// <summary>
+    /// 车牌号
+    /// </summary>
+    public string? PlateNumber { get; set; }
 }
 
 /// <summary>

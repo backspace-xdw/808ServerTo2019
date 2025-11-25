@@ -12,15 +12,17 @@ public class JT808TcpServer
 {
     private readonly ILogger<JT808TcpServer> _logger;
     private readonly SessionManager _sessionManager;
+    private readonly LocationDataStore _locationDataStore;
     private Socket? _serverSocket;
     private bool _isRunning;
     private readonly int _port;
     private readonly int _backlog;
 
-    public JT808TcpServer(ILogger<JT808TcpServer> logger, int port = 8809, int backlog = 10000)
+    public JT808TcpServer(ILogger<JT808TcpServer> logger, int port = 8809, int backlog = 10000, string locationDataDir = "LocationData")
     {
         _logger = logger;
         _sessionManager = new SessionManager();
+        _locationDataStore = new LocationDataStore(locationDataDir);
         _port = port;
         _backlog = backlog;
     }
@@ -336,6 +338,7 @@ public class JT808TcpServer
 
             // 保存终端信息
             session.TerminalModel = registerInfo.TerminalModel;
+            session.PlateNumber = registerInfo.PlateNumber;
 
             // 生成鉴权码(实际应用中应该存储到数据库)
             string authCode = Guid.NewGuid().ToString("N").Substring(0, 20); // 2019版本最长50字节
@@ -413,12 +416,25 @@ public class JT808TcpServer
                 : "";
 
             _logger.LogInformation($"位置上报: 手机号={message.Header.PhoneNumber}, " +
+                                 $"车牌={session.PlateNumber ?? "未知"}, " +
                                  $"经度={location.GetLongitude():F6}, 纬度={location.GetLatitude():F6}, " +
                                  $"速度={location.GetSpeed():F1}km/h, 时间={location.GpsTime:yyyy-MM-dd HH:mm:ss}, " +
                                  $"ACC={(location.IsAccOn ? "开" : "关")}, 定位={(location.IsPositioned ? "是" : "否")}" +
                                  additionalInfo);
 
-            // TODO: 存储位置数据到数据库
+            // 保存位置数据到文件（以车牌号为文件名）
+            try
+            {
+                _locationDataStore.SaveLocation(
+                    session.PlateNumber ?? string.Empty,
+                    message.Header.PhoneNumber,
+                    location);
+                _logger.LogDebug($"位置数据已保存: 车牌={session.PlateNumber ?? message.Header.PhoneNumber}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "保存位置数据失败");
+            }
         }
 
         return JT808Encoder.EncodePlatformGeneralResponse(
@@ -500,4 +516,9 @@ public class JT808TcpServer
     /// 获取会话管理器
     /// </summary>
     public SessionManager GetSessionManager() => _sessionManager;
+
+    /// <summary>
+    /// 获取位置数据存储器
+    /// </summary>
+    public LocationDataStore GetLocationDataStore() => _locationDataStore;
 }
