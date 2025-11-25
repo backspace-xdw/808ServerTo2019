@@ -1,25 +1,53 @@
 using JT808.Server;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+
+// 加载配置文件
+var configuration = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+    .Build();
+
+// 绑定配置
+var serverConfig = new ServerConfig();
+configuration.GetSection("ServerConfig").Bind(serverConfig);
+
+// 解析日志级别
+var logLevel = Enum.TryParse<LogLevel>(serverConfig.LogLevel, true, out var level)
+    ? level
+    : LogLevel.Information;
 
 // 创建日志工厂
 using var loggerFactory = LoggerFactory.Create(builder =>
 {
     builder
         .AddConsole()
-        .SetMinimumLevel(LogLevel.Information);
+        .SetMinimumLevel(logLevel);
 });
 
 var logger = loggerFactory.CreateLogger<JT808TcpServer>();
 
 // 创建并启动服务器
-var server = new JT808TcpServer(logger, port: 8809, backlog: 10000);
+var server = new JT808TcpServer(
+    logger,
+    ipAddress: serverConfig.IpAddress,
+    port: serverConfig.Port,
+    backlog: serverConfig.MaxConnections,
+    locationDataDir: serverConfig.LocationDataDirectory,
+    sessionTimeoutMinutes: serverConfig.SessionTimeoutMinutes);
 
 Console.WriteLine("=".PadRight(60, '='));
 Console.WriteLine("JT808-2019 车载终端通讯服务器");
 Console.WriteLine("基于 JT/T 808-2019 协议");
-Console.WriteLine("支持 10000+ 并发连接");
+Console.WriteLine($"支持 {serverConfig.MaxConnections}+ 并发连接");
 Console.WriteLine("支持 2013 和 2019 版本自动识别");
 Console.WriteLine("=".PadRight(60, '='));
+Console.WriteLine();
+Console.WriteLine("当前配置:");
+Console.WriteLine($"  监听地址: {serverConfig.IpAddress}:{serverConfig.Port}");
+Console.WriteLine($"  数据目录: {serverConfig.LocationDataDirectory}");
+Console.WriteLine($"  会话超时: {serverConfig.SessionTimeoutMinutes} 分钟");
+Console.WriteLine($"  日志级别: {serverConfig.LogLevel}");
 Console.WriteLine();
 
 try

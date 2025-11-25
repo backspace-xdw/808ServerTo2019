@@ -15,16 +15,26 @@ public class JT808TcpServer
     private readonly LocationDataStore _locationDataStore;
     private Socket? _serverSocket;
     private bool _isRunning;
+    private readonly string _ipAddress;
     private readonly int _port;
     private readonly int _backlog;
+    private readonly int _sessionTimeoutMinutes;
 
-    public JT808TcpServer(ILogger<JT808TcpServer> logger, int port = 8809, int backlog = 10000, string locationDataDir = "LocationData")
+    public JT808TcpServer(
+        ILogger<JT808TcpServer> logger,
+        string ipAddress = "0.0.0.0",
+        int port = 8809,
+        int backlog = 10000,
+        string locationDataDir = "LocationData",
+        int sessionTimeoutMinutes = 30)
     {
         _logger = logger;
         _sessionManager = new SessionManager();
         _locationDataStore = new LocationDataStore(locationDataDir);
+        _ipAddress = ipAddress;
         _port = port;
         _backlog = backlog;
+        _sessionTimeoutMinutes = sessionTimeoutMinutes;
     }
 
     /// <summary>
@@ -46,12 +56,14 @@ public class JT808TcpServer
             _serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             _serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
 
-            var endPoint = new IPEndPoint(IPAddress.Any, _port);
+            // 解析配置的IP地址
+            var ipAddr = _ipAddress == "0.0.0.0" ? IPAddress.Any : IPAddress.Parse(_ipAddress);
+            var endPoint = new IPEndPoint(ipAddr, _port);
             _serverSocket.Bind(endPoint);
             _serverSocket.Listen(_backlog);
 
             _isRunning = true;
-            _logger.LogInformation($"JT808-2019服务器启动成功,监听端口: {_port}");
+            _logger.LogInformation($"JT808-2019服务器启动成功,监听地址: {_ipAddress}:{_port}");
 
             // 启动清理超时会话的定时任务
             Task.Run(CleanupTask);
@@ -496,7 +508,7 @@ public class JT808TcpServer
             try
             {
                 await Task.Delay(TimeSpan.FromMinutes(5));
-                _sessionManager.CleanupTimeoutSessions(30);
+                _sessionManager.CleanupTimeoutSessions(_sessionTimeoutMinutes);
 
                 var onlineCount = _sessionManager.GetOnlineCount();
                 var sessions = _sessionManager.GetAllSessions();
