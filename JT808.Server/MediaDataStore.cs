@@ -36,13 +36,16 @@ public class MediaDataStore
             Directory.CreateDirectory(dateDir);
         }
 
+        // 标准化手机号为12位
+        var normalizedPhone = NormalizePhoneNumber(phoneNumber);
+
         // 生成文件名: 手机号_多媒体格式编码_事件项编码_时-分-秒.扩展名
-        // 例如: 014818454246_3_1_10-21-22.JPEG
+        // 例如: 014818454246_0_1_10-21-22.JPEG
         var timeStr = DateTime.Now.ToString("HH-mm-ss");
         var formatCode = (int)multimedia.Format;
         var eventCode = (int)multimedia.Event;
         var extension = multimedia.GetFileExtensionUpper();
-        var fileName = $"{phoneNumber}_{formatCode}_{eventCode}_{timeStr}{extension}";
+        var fileName = $"{normalizedPhone}_{formatCode}_{eventCode}_{timeStr}{extension}";
         var filePath = Path.Combine(dateDir, fileName);
 
         lock (_lockObj)
@@ -51,6 +54,24 @@ public class MediaDataStore
         }
 
         return filePath;
+    }
+
+    /// <summary>
+    /// 标准化手机号为12位
+    /// </summary>
+    private string NormalizePhoneNumber(string phoneNumber)
+    {
+        // 去掉前导0
+        var trimmed = phoneNumber.TrimStart('0');
+
+        // 如果全是0或空，返回12个0
+        if (string.IsNullOrEmpty(trimmed))
+        {
+            return "000000000000";
+        }
+
+        // 补齐到12位（不足前面补0）
+        return trimmed.PadLeft(12, '0');
     }
 
     /// <summary>

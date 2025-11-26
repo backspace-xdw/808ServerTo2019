@@ -23,23 +23,43 @@ public class LocationDataStore
     }
 
     /// <summary>
-    /// 保存位置信息到XML文件（以手机号为文件名，不足12位前面补0）
+    /// 保存位置信息到XML文件（以手机号为文件名，标准化为12位）
     /// </summary>
     /// <param name="plateNumber">车牌号</param>
     /// <param name="phoneNumber">终端手机号</param>
     /// <param name="location">位置信息</param>
     public void SaveLocation(string plateNumber, string phoneNumber, LocationInfo location)
     {
-        // 手机号不足12位前面补0
-        var paddedPhone = phoneNumber.PadLeft(12, '0');
-        var filePath = Path.Combine(_dataDirectory, $"{paddedPhone}.xml");
+        // 标准化手机号为12位：先去掉前导0，再补齐到12位
+        var normalizedPhone = NormalizePhoneNumber(phoneNumber);
+        var filePath = Path.Combine(_dataDirectory, $"{normalizedPhone}.xml");
 
-        var content = FormatLocationXml(paddedPhone, location);
+        var content = FormatLocationXml(normalizedPhone, location);
 
         lock (_lockObj)
         {
             File.WriteAllText(filePath, content, Encoding.UTF8);
         }
+    }
+
+    /// <summary>
+    /// 标准化手机号为12位
+    /// JT808协议中2019版本手机号为10字节BCD码(20位数字)，2013版本为6字节(12位数字)
+    /// 需要去掉前导0后再补齐到12位
+    /// </summary>
+    private string NormalizePhoneNumber(string phoneNumber)
+    {
+        // 去掉前导0
+        var trimmed = phoneNumber.TrimStart('0');
+
+        // 如果全是0或空，返回12个0
+        if (string.IsNullOrEmpty(trimmed))
+        {
+            return "000000000000";
+        }
+
+        // 补齐到12位（不足前面补0）
+        return trimmed.PadLeft(12, '0');
     }
 
     /// <summary>
