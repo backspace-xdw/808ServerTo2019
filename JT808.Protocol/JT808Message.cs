@@ -436,7 +436,7 @@ public class MultimediaDataUpload
     public byte[] Data { get; set; } = Array.Empty<byte>();
 
     /// <summary>
-    /// 获取文件扩展名
+    /// 获取文件扩展名 (小写)
     /// </summary>
     public string GetFileExtension()
     {
@@ -448,6 +448,22 @@ public class MultimediaDataUpload
             MultimediaFormat.WAV => ".wav",
             MultimediaFormat.WMV => ".wmv",
             _ => ".bin"
+        };
+    }
+
+    /// <summary>
+    /// 获取文件扩展名 (大写)
+    /// </summary>
+    public string GetFileExtensionUpper()
+    {
+        return Format switch
+        {
+            MultimediaFormat.JPEG => ".JPEG",
+            MultimediaFormat.TIF => ".TIF",
+            MultimediaFormat.MP3 => ".MP3",
+            MultimediaFormat.WAV => ".WAV",
+            MultimediaFormat.WMV => ".WMV",
+            _ => ".BIN"
         };
     }
 

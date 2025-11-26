@@ -29,17 +29,21 @@ public class MediaDataStore
     /// <returns>保存的文件路径</returns>
     public string SaveMedia(string phoneNumber, MultimediaDataUpload multimedia)
     {
-        // 创建以手机号命名的子目录
-        var phoneDir = Path.Combine(_dataDirectory, phoneNumber);
-        if (!Directory.Exists(phoneDir))
+        // 创建以日期命名的子目录 (格式: 2025-03-08)
+        var dateDir = Path.Combine(_dataDirectory, DateTime.Now.ToString("yyyy-MM-dd"));
+        if (!Directory.Exists(dateDir))
         {
-            Directory.CreateDirectory(phoneDir);
+            Directory.CreateDirectory(dateDir);
         }
 
-        // 生成文件名: 时间戳_多媒体ID_通道ID.扩展名
-        var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-        var fileName = $"{timestamp}_{multimedia.MultimediaId}_CH{multimedia.ChannelId}{multimedia.GetFileExtension()}";
-        var filePath = Path.Combine(phoneDir, fileName);
+        // 生成文件名: 手机号_多媒体格式编码_事件项编码_时-分-秒.扩展名
+        // 例如: 014818454246_3_1_10-21-22.JPEG
+        var timeStr = DateTime.Now.ToString("HH-mm-ss");
+        var formatCode = (int)multimedia.Format;
+        var eventCode = (int)multimedia.Event;
+        var extension = multimedia.GetFileExtensionUpper();
+        var fileName = $"{phoneNumber}_{formatCode}_{eventCode}_{timeStr}{extension}";
+        var filePath = Path.Combine(dateDir, fileName);
 
         lock (_lockObj)
         {
