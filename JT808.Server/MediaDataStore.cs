@@ -4,6 +4,42 @@ using JT808.Protocol;
 namespace JT808.Server;
 
 /// <summary>
+/// 多媒体处理结果
+/// </summary>
+public class MediaProcessResult
+{
+    /// <summary>
+    /// 是否完成（所有分包已收齐）
+    /// </summary>
+    public bool IsComplete { get; set; }
+
+    /// <summary>
+    /// 保存的文件路径（完成时有值）
+    /// </summary>
+    public string? FilePath { get; set; }
+
+    /// <summary>
+    /// 多媒体ID
+    /// </summary>
+    public uint MultimediaId { get; set; }
+
+    /// <summary>
+    /// 需要重传的包ID列表
+    /// </summary>
+    public List<ushort> MissingPackageIds { get; set; } = new();
+
+    /// <summary>
+    /// 当前已收到的包数
+    /// </summary>
+    public int ReceivedCount { get; set; }
+
+    /// <summary>
+    /// 总包数
+    /// </summary>
+    public int TotalCount { get; set; }
+}
+
+/// <summary>
 /// 多媒体分包缓存项
 /// </summary>
 public class MediaPackageCache
@@ -17,11 +53,28 @@ public class MediaPackageCache
     public ushort TotalPackages { get; set; }
     public Dictionary<ushort, byte[]> Packages { get; set; } = new();
     public DateTime CreateTime { get; set; } = DateTime.Now;
+    public DateTime LastUpdateTime { get; set; } = DateTime.Now;
     public LocationInfo? Location { get; set; }
+
+    /// <summary>
+    /// 获取缺失的包ID列表
+    /// </summary>
+    public List<ushort> GetMissingPackageIds()
+    {
+        var missing = new List<ushort>();
+        for (ushort i = 1; i <= TotalPackages; i++)
+        {
+            if (!Packages.ContainsKey(i))
+            {
+                missing.Add(i);
+            }
+        }
+        return missing;
+    }
 }
 
 /// <summary>
-/// 多媒体数据存储器 - 支持分包组装
+/// 多媒体数据存储器 - 支持分包组装和漏包重传
 /// </summary>
 public class MediaDataStore
 {
@@ -33,6 +86,9 @@ public class MediaDataStore
 
     // 缓存超时时间（分钟）
     private const int CacheTimeoutMinutes = 10;
+
+    // 等待重传超时时间（秒）- 收到最后一个包后等待这么长时间检查漏包
+    private const int RetransmitWaitSeconds = 5;
 
     public MediaDataStore(string dataDirectory = "MediaData")
     {
@@ -49,22 +105,30 @@ public class MediaDataStore
     }
 
     /// <summary>
-    /// 处理多媒体数据（支持分包）
+    /// 处理多媒体数据（支持分包和漏包检测）
     /// </summary>
     /// <param name="phoneNumber">终端手机号</param>
     /// <param name="multimedia">多媒体数据</param>
     /// <param name="totalPackages">总包数（0表示不分包）</param>
     /// <param name="packageIndex">当前包序号（从1开始）</param>
-    /// <returns>如果数据完整则返回保存的文件路径，否则返回null</returns>
-    public string? ProcessMedia(string phoneNumber, MultimediaDataUpload multimedia,
+    /// <returns>处理结果，包含是否完成、漏包列表等信息</returns>
+    public MediaProcessResult ProcessMedia(string phoneNumber, MultimediaDataUpload multimedia,
         ushort totalPackages, ushort packageIndex)
     {
         var normalizedPhone = NormalizePhoneNumber(phoneNumber);
+        var result = new MediaProcessResult
+        {
+            MultimediaId = multimedia.MultimediaId
+        };
 
         // 不分包或只有1包，直接保存
         if (totalPackages <= 1)
         {
-            return SaveMediaFile(normalizedPhone, multimedia);
+            result.IsComplete = true;
+            result.FilePath = SaveMediaFile(normalizedPhone, multimedia);
+            result.TotalCount = 1;
+            result.ReceivedCount = 1;
+            return result;
         }
 
         // 分包处理
@@ -83,40 +147,96 @@ public class MediaDataStore
             Location = multimedia.Location
         });
 
-        // 添加当前分包数据
         lock (cache)
         {
+            // 添加当前分包数据
             cache.Packages[packageIndex] = multimedia.Data;
+            cache.LastUpdateTime = DateTime.Now;
+
+            result.TotalCount = cache.TotalPackages;
+            result.ReceivedCount = cache.Packages.Count;
 
             // 检查是否收齐所有分包
             if (cache.Packages.Count >= cache.TotalPackages)
             {
-                // 组装完整数据
-                var completeData = AssemblePackages(cache);
-
-                // 创建完整的多媒体对象
-                var completeMultimedia = new MultimediaDataUpload
+                // 再次确认没有漏包
+                var missingIds = cache.GetMissingPackageIds();
+                if (missingIds.Count == 0)
                 {
-                    MultimediaId = cache.MultimediaId,
-                    Type = cache.Type,
-                    Format = cache.Format,
-                    Event = cache.Event,
-                    ChannelId = cache.ChannelId,
-                    Location = cache.Location,
-                    Data = completeData
-                };
+                    // 组装完整数据
+                    var completeData = AssemblePackages(cache);
 
-                // 保存文件
-                var filePath = SaveMediaFile(normalizedPhone, completeMultimedia);
+                    // 创建完整的多媒体对象
+                    var completeMultimedia = new MultimediaDataUpload
+                    {
+                        MultimediaId = cache.MultimediaId,
+                        Type = cache.Type,
+                        Format = cache.Format,
+                        Event = cache.Event,
+                        ChannelId = cache.ChannelId,
+                        Location = cache.Location,
+                        Data = completeData
+                    };
 
-                // 移除缓存
-                _packageCache.TryRemove(cacheKey, out _);
+                    // 保存文件
+                    result.IsComplete = true;
+                    result.FilePath = SaveMediaFile(normalizedPhone, completeMultimedia);
 
-                return filePath;
+                    // 移除缓存
+                    _packageCache.TryRemove(cacheKey, out _);
+                }
+                else
+                {
+                    // 有漏包，返回漏包列表
+                    result.IsComplete = false;
+                    result.MissingPackageIds = missingIds;
+                }
+            }
+            else
+            {
+                // 还未收齐，检查是否是最后一个包（可能有漏包）
+                // 如果当前包序号等于总包数，说明终端认为已发完，检查漏包
+                if (packageIndex == totalPackages)
+                {
+                    var missingIds = cache.GetMissingPackageIds();
+                    if (missingIds.Count > 0)
+                    {
+                        result.MissingPackageIds = missingIds;
+                    }
+                }
+
+                result.IsComplete = false;
             }
         }
 
-        return null; // 还未收齐所有分包
+        return result;
+    }
+
+    /// <summary>
+    /// 检查指定多媒体的漏包情况（用于超时检查）
+    /// </summary>
+    public MediaProcessResult? CheckMissingPackages(string phoneNumber, uint multimediaId)
+    {
+        var normalizedPhone = NormalizePhoneNumber(phoneNumber);
+        var cacheKey = $"{normalizedPhone}_{multimediaId}";
+
+        if (_packageCache.TryGetValue(cacheKey, out var cache))
+        {
+            lock (cache)
+            {
+                var missingIds = cache.GetMissingPackageIds();
+                return new MediaProcessResult
+                {
+                    MultimediaId = multimediaId,
+                    IsComplete = false,
+                    MissingPackageIds = missingIds,
+                    ReceivedCount = cache.Packages.Count,
+                    TotalCount = cache.TotalPackages
+                };
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -211,7 +331,7 @@ public class MediaDataStore
                 await Task.Delay(TimeSpan.FromMinutes(1));
 
                 var expiredKeys = _packageCache
-                    .Where(kv => (DateTime.Now - kv.Value.CreateTime).TotalMinutes > CacheTimeoutMinutes)
+                    .Where(kv => (DateTime.Now - kv.Value.LastUpdateTime).TotalMinutes > CacheTimeoutMinutes)
                     .Select(kv => kv.Key)
                     .ToList();
 

@@ -158,6 +158,37 @@ public class JT808Encoder
     }
 
     /// <summary>
+    /// 多媒体数据上传应答 (0x8800)
+    /// </summary>
+    /// <param name="phoneNumber">手机号</param>
+    /// <param name="multimediaId">多媒体ID</param>
+    /// <param name="retransmitPackageIds">需要重传的包ID列表（为空表示成功无需重传）</param>
+    /// <param name="is2019">是否2019版本</param>
+    public static byte[] EncodeMultimediaDataUploadResponse(string phoneNumber, uint multimediaId,
+        List<ushort>? retransmitPackageIds = null, bool is2019 = true)
+    {
+        var body = new List<byte>();
+
+        // 多媒体ID (4字节)
+        WriteUInt32(body, multimediaId);
+
+        // 重传包数量
+        byte retransmitCount = (byte)(retransmitPackageIds?.Count ?? 0);
+        body.Add(retransmitCount);
+
+        // 重传包ID列表
+        if (retransmitPackageIds != null && retransmitPackageIds.Count > 0)
+        {
+            foreach (var packageId in retransmitPackageIds)
+            {
+                WriteUInt16(body, packageId);
+            }
+        }
+
+        return Encode(JT808MessageId.MultimediaDataUploadResponse, phoneNumber, body.ToArray(), is2019);
+    }
+
+    /// <summary>
     /// 转义处理
     /// </summary>
     private static byte[] Escape(byte[] data)
