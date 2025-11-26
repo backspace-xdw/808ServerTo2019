@@ -4,7 +4,7 @@ using JT808.Protocol;
 namespace JT808.Server;
 
 /// <summary>
-/// 位置数据存储器 - 以车牌号为文件名保存最新位置信息
+/// 位置数据存储器 - 以手机号为文件名保存最新位置信息
 /// </summary>
 public class LocationDataStore
 {
@@ -23,21 +23,15 @@ public class LocationDataStore
     }
 
     /// <summary>
-    /// 保存位置信息到文件（以车牌号为文件名，覆盖之前的数据）
+    /// 保存位置信息到文件（以手机号为文件名，覆盖之前的数据）
     /// </summary>
     /// <param name="plateNumber">车牌号</param>
     /// <param name="phoneNumber">终端手机号</param>
     /// <param name="location">位置信息</param>
     public void SaveLocation(string plateNumber, string phoneNumber, LocationInfo location)
     {
-        if (string.IsNullOrWhiteSpace(plateNumber))
-        {
-            // 如果没有车牌号，使用手机号作为文件名
-            plateNumber = $"未知车牌_{phoneNumber}";
-        }
-
-        // 清理文件名中的非法字符
-        var safeFileName = GetSafeFileName(plateNumber);
+        // 直接使用手机号作为文件名
+        var safeFileName = GetSafeFileName(phoneNumber);
         var filePath = Path.Combine(_dataDirectory, $"{safeFileName}.txt");
 
         var content = FormatLocationInfo(plateNumber, phoneNumber, location);
