@@ -34,6 +34,7 @@ var server = new JT808TcpServer(
     port: serverConfig.Port,
     backlog: serverConfig.MaxConnections,
     locationDataDir: serverConfig.LocationDataDirectory,
+    mediaDataDir: serverConfig.MediaDataDirectory,
     sessionTimeoutMinutes: serverConfig.SessionTimeoutMinutes);
 
 Console.WriteLine("=".PadRight(60, '='));
@@ -45,7 +46,8 @@ Console.WriteLine("=".PadRight(60, '='));
 Console.WriteLine();
 Console.WriteLine("当前配置:");
 Console.WriteLine($"  监听地址: {serverConfig.IpAddress}:{serverConfig.Port}");
-Console.WriteLine($"  数据目录: {serverConfig.LocationDataDirectory}");
+Console.WriteLine($"  位置目录: {serverConfig.LocationDataDirectory}");
+Console.WriteLine($"  媒体目录: {serverConfig.MediaDataDirectory}");
 Console.WriteLine($"  会话超时: {serverConfig.SessionTimeoutMinutes} 分钟");
 Console.WriteLine($"  日志级别: {serverConfig.LogLevel}");
 Console.WriteLine();

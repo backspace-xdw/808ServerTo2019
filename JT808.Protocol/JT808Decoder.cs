@@ -313,4 +313,83 @@ public class JT808Decoder
         offset += length;
         return str;
     }
+
+    /// <summary>
+    /// 解析多媒体数据上传 (0x0801)
+    /// </summary>
+    public static MultimediaDataUpload? DecodeMultimediaDataUpload(byte[] body)
+    {
+        // 最小长度: 4(ID) + 1(类型) + 1(格式) + 1(事件) + 1(通道) + 28(位置) = 36字节
+        if (body == null || body.Length < 36)
+            return null;
+
+        int offset = 0;
+        var multimedia = new MultimediaDataUpload
+        {
+            MultimediaId = ReadUInt32(body, ref offset),
+            Type = (MultimediaType)body[offset++],
+            Format = (MultimediaFormat)body[offset++],
+            Event = (MultimediaEvent)body[offset++],
+            ChannelId = body[offset++]
+        };
+
+        // 解析位置信息 (28字节基本位置信息，不含附加信息)
+        if (offset + 28 <= body.Length)
+        {
+            var locationData = new byte[28];
+            Array.Copy(body, offset, locationData, 0, 28);
+            multimedia.Location = DecodeLocationInfoBasic(locationData);
+            offset += 28;
+        }
+
+        // 剩余为多媒体数据
+        if (offset < body.Length)
+        {
+            int dataLength = body.Length - offset;
+            multimedia.Data = new byte[dataLength];
+            Array.Copy(body, offset, multimedia.Data, 0, dataLength);
+        }
+
+        return multimedia;
+    }
+
+    /// <summary>
+    /// 解析基本位置信息 (28字节，不含附加信息)
+    /// </summary>
+    private static LocationInfo DecodeLocationInfoBasic(byte[] data)
+    {
+        int offset = 0;
+        var location = new LocationInfo
+        {
+            AlarmFlag = ReadUInt32(data, ref offset),
+            Status = ReadUInt32(data, ref offset),
+            Latitude = ReadUInt32(data, ref offset),
+            Longitude = ReadUInt32(data, ref offset),
+            Altitude = ReadUInt16(data, ref offset),
+            Speed = ReadUInt16(data, ref offset),
+            Direction = ReadUInt16(data, ref offset)
+        };
+
+        // BCD码时间 YY-MM-DD-hh-mm-ss (6字节)
+        var timeStr = ReadBCD(data, ref offset, 6);
+        if (timeStr.Length == 12)
+        {
+            try
+            {
+                int year = 2000 + int.Parse(timeStr.Substring(0, 2));
+                int month = int.Parse(timeStr.Substring(2, 2));
+                int day = int.Parse(timeStr.Substring(4, 2));
+                int hour = int.Parse(timeStr.Substring(6, 2));
+                int minute = int.Parse(timeStr.Substring(8, 2));
+                int second = int.Parse(timeStr.Substring(10, 2));
+                location.GpsTime = new DateTime(year, month, day, hour, minute, second);
+            }
+            catch
+            {
+                location.GpsTime = DateTime.Now;
+            }
+        }
+
+        return location;
+    }
 }

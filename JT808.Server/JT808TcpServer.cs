@@ -13,6 +13,7 @@ public class JT808TcpServer
     private readonly ILogger<JT808TcpServer> _logger;
     private readonly SessionManager _sessionManager;
     private readonly LocationDataStore _locationDataStore;
+    private readonly MediaDataStore _mediaDataStore;
     private Socket? _serverSocket;
     private bool _isRunning;
     private readonly string _ipAddress;
@@ -26,11 +27,13 @@ public class JT808TcpServer
         int port = 8809,
         int backlog = 10000,
         string locationDataDir = "LocationData",
+        string mediaDataDir = "MediaData",
         int sessionTimeoutMinutes = 30)
     {
         _logger = logger;
         _sessionManager = new SessionManager();
         _locationDataStore = new LocationDataStore(locationDataDir);
+        _mediaDataStore = new MediaDataStore(mediaDataDir);
         _ipAddress = ipAddress;
         _port = port;
         _backlog = backlog;
@@ -312,6 +315,10 @@ public class JT808TcpServer
                     response = HandleLocationBatchUpload(session, message);
                     break;
 
+                case JT808MessageId.MultimediaDataUpload:
+                    response = HandleMultimediaDataUpload(session, message);
+                    break;
+
                 default:
                     _logger.LogWarning($"未处理的消息类型: 0x{message.Header.MessageId:X4}");
                     // 返回通用应答-不支持
@@ -465,6 +472,41 @@ public class JT808TcpServer
         _logger.LogInformation($"批量位置上传: 手机号={message.Header.PhoneNumber}, 数据长度={message.Body.Length}");
 
         // TODO: 解析批量位置数据
+
+        return JT808Encoder.EncodePlatformGeneralResponse(
+            message.Header.PhoneNumber,
+            message.Header.SerialNumber,
+            message.Header.MessageId,
+            (byte)CommonResult.Success,
+            session.Is2019Version);
+    }
+
+    /// <summary>
+    /// 处理多媒体数据上传 (0x0801)
+    /// </summary>
+    private byte[] HandleMultimediaDataUpload(SessionInfo session, JT808Message message)
+    {
+        var multimedia = JT808Decoder.DecodeMultimediaDataUpload(message.Body);
+        if (multimedia != null)
+        {
+            _logger.LogInformation($"多媒体数据上传: 手机号={message.Header.PhoneNumber}, " +
+                                 $"多媒体ID={multimedia.MultimediaId}, " +
+                                 $"类型={multimedia.GetTypeName()}, " +
+                                 $"格式={multimedia.Format}, " +
+                                 $"通道={multimedia.ChannelId}, " +
+                                 $"数据大小={multimedia.Data.Length}字节");
+
+            // 保存多媒体数据到文件
+            try
+            {
+                var filePath = _mediaDataStore.SaveMedia(message.Header.PhoneNumber, multimedia);
+                _logger.LogInformation($"多媒体文件已保存: {filePath}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "保存多媒体数据失败");
+            }
+        }
 
         return JT808Encoder.EncodePlatformGeneralResponse(
             message.Header.PhoneNumber,

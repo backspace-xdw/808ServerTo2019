@@ -357,3 +357,111 @@ public class TerminalProperties
     /// </summary>
     public byte CommunicationProperties { get; set; }
 }
+
+/// <summary>
+/// 多媒体类型
+/// </summary>
+public enum MultimediaType : byte
+{
+    Image = 0,      // 图像
+    Audio = 1,      // 音频
+    Video = 2       // 视频
+}
+
+/// <summary>
+/// 多媒体格式编码
+/// </summary>
+public enum MultimediaFormat : byte
+{
+    JPEG = 0,       // JPEG
+    TIF = 1,        // TIF
+    MP3 = 2,        // MP3
+    WAV = 3,        // WAV
+    WMV = 4         // WMV
+}
+
+/// <summary>
+/// 多媒体事件项编码
+/// </summary>
+public enum MultimediaEvent : byte
+{
+    PlatformCommand = 0,        // 平台下发指令
+    TimerAction = 1,            // 定时动作
+    RobberyAlarm = 2,           // 抢劫报警触发
+    CollisionRolloverAlarm = 3, // 碰撞侧翻报警触发
+    OpenDoor = 4,               // 门开拍照 (2019新增)
+    CloseDoor = 5               // 门关拍照 (2019新增)
+}
+
+/// <summary>
+/// 多媒体数据上传 (0x0801)
+/// </summary>
+public class MultimediaDataUpload
+{
+    /// <summary>
+    /// 多媒体ID (4字节)
+    /// </summary>
+    public uint MultimediaId { get; set; }
+
+    /// <summary>
+    /// 多媒体类型 (1字节)
+    /// 0:图像 1:音频 2:视频
+    /// </summary>
+    public MultimediaType Type { get; set; }
+
+    /// <summary>
+    /// 多媒体格式编码 (1字节)
+    /// 0:JPEG 1:TIF 2:MP3 3:WAV 4:WMV
+    /// </summary>
+    public MultimediaFormat Format { get; set; }
+
+    /// <summary>
+    /// 事件项编码 (1字节)
+    /// </summary>
+    public MultimediaEvent Event { get; set; }
+
+    /// <summary>
+    /// 通道ID (1字节)
+    /// </summary>
+    public byte ChannelId { get; set; }
+
+    /// <summary>
+    /// 位置信息汇报 (28字节)
+    /// </summary>
+    public LocationInfo? Location { get; set; }
+
+    /// <summary>
+    /// 多媒体数据包
+    /// </summary>
+    public byte[] Data { get; set; } = Array.Empty<byte>();
+
+    /// <summary>
+    /// 获取文件扩展名
+    /// </summary>
+    public string GetFileExtension()
+    {
+        return Format switch
+        {
+            MultimediaFormat.JPEG => ".jpg",
+            MultimediaFormat.TIF => ".tif",
+            MultimediaFormat.MP3 => ".mp3",
+            MultimediaFormat.WAV => ".wav",
+            MultimediaFormat.WMV => ".wmv",
+            _ => ".bin"
+        };
+    }
+
+    /// <summary>
+    /// 获取多媒体类型名称
+    /// </summary>
+    public string GetTypeName()
+    {
+        return Type switch
+        {
+            MultimediaType.Image => "图像",
+            MultimediaType.Audio => "音频",
+            MultimediaType.Video => "视频",
+            _ => "未知"
+        };
+    }
+}

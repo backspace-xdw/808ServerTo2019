@@ -26,6 +26,11 @@ public class ServerConfig
     public string LocationDataDirectory { get; set; } = "LocationData";
 
     /// <summary>
+    /// 多媒体数据存储目录，默认为 MediaData
+    /// </summary>
+    public string MediaDataDirectory { get; set; } = "MediaData";
+
+    /// <summary>
     /// 会话超时时间(分钟)，默认为 30 分钟
     /// </summary>
     public int SessionTimeoutMinutes { get; set; } = 30;
