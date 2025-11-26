@@ -489,18 +489,49 @@ public class JT808TcpServer
         var multimedia = JT808Decoder.DecodeMultimediaDataUpload(message.Body);
         if (multimedia != null)
         {
-            _logger.LogInformation($"多媒体数据上传: 手机号={message.Header.PhoneNumber}, " +
-                                 $"多媒体ID={multimedia.MultimediaId}, " +
-                                 $"类型={multimedia.GetTypeName()}, " +
-                                 $"格式={multimedia.Format}, " +
-                                 $"通道={multimedia.ChannelId}, " +
-                                 $"数据大小={multimedia.Data.Length}字节");
+            // 获取分包信息
+            ushort totalPackages = 0;
+            ushort packageIndex = 0;
 
-            // 保存多媒体数据到文件
+            if (message.Header.IsPackage && message.Header.Package != null)
+            {
+                totalPackages = message.Header.Package.TotalPackage;
+                packageIndex = message.Header.Package.PackageIndex;
+
+                _logger.LogInformation($"多媒体数据上传(分包): 手机号={message.Header.PhoneNumber}, " +
+                                     $"多媒体ID={multimedia.MultimediaId}, " +
+                                     $"类型={multimedia.GetTypeName()}, " +
+                                     $"格式={multimedia.Format}, " +
+                                     $"分包={packageIndex}/{totalPackages}, " +
+                                     $"数据大小={multimedia.Data.Length}字节");
+            }
+            else
+            {
+                _logger.LogInformation($"多媒体数据上传: 手机号={message.Header.PhoneNumber}, " +
+                                     $"多媒体ID={multimedia.MultimediaId}, " +
+                                     $"类型={multimedia.GetTypeName()}, " +
+                                     $"格式={multimedia.Format}, " +
+                                     $"通道={multimedia.ChannelId}, " +
+                                     $"数据大小={multimedia.Data.Length}字节");
+            }
+
+            // 处理多媒体数据（支持分包组装）
             try
             {
-                var filePath = _mediaDataStore.SaveMedia(message.Header.PhoneNumber, multimedia);
-                _logger.LogInformation($"多媒体文件已保存: {filePath}");
+                var filePath = _mediaDataStore.ProcessMedia(
+                    message.Header.PhoneNumber,
+                    multimedia,
+                    totalPackages,
+                    packageIndex);
+
+                if (filePath != null)
+                {
+                    _logger.LogInformation($"多媒体文件已保存: {filePath}");
+                }
+                else if (totalPackages > 1)
+                {
+                    _logger.LogDebug($"多媒体分包已缓存: {packageIndex}/{totalPackages}");
+                }
             }
             catch (Exception ex)
             {
