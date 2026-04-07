@@ -206,8 +206,10 @@ public class LocationDataStore : IAsyncDisposable
         sb.Append($"<YunYinZT>{yunYinZt}</YunYinZT>");
 
         // ----- 位置/运动字段 -----
-        sb.Append($"<Longitude>{longitude.ToString("F6", Inv)}</Longitude>");
-        sb.Append($"<Latitude>{latitude.ToString("F6", Inv)}</Latitude>");
+        // 注意: 上游平台约定 <Longitude> 标签里写"纬度值", <Latitude> 标签里写"经度值"
+        // (字段名与地理含义反着, 是上游历史约定, 不要"修正"它)
+        sb.Append($"<Longitude>{latitude.ToString("F6", Inv)}</Longitude>");
+        sb.Append($"<Latitude>{longitude.ToString("F6", Inv)}</Latitude>");
         sb.Append($"<GaoDu>{altitude.ToString("F6", Inv)}</GaoDu>");
         sb.Append($"<Speed>{speed.ToString("F1", Inv)}</Speed>");
         sb.Append($"<direction>{directionRad.ToString("F2", Inv)}</direction>");
