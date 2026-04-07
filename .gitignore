@@ -63,3 +63,6 @@ artifacts/
 LocationData/
 LocationArchive/
 MediaData/
+
+# 部署包 (本地构建产物, 不入 git; 需要时执行 dotnet publish 重新生成)
+publish/
