@@ -503,17 +503,7 @@ public class JT808TcpServer
 
     private byte[] HandleMultimediaDataUpload(SessionInfo session, JT808Message message)
     {
-        var multimedia = JT808Decoder.DecodeMultimediaDataUpload(message.Body);
-        if (multimedia == null)
-        {
-            return JT808Encoder.EncodePlatformGeneralResponse(
-                message.Header.PhoneNumber,
-                message.Header.SerialNumber,
-                message.Header.MessageId,
-                (byte)CommonResult.Failure,
-                session.Is2019Version);
-        }
-
+        // 提取分包信息
         ushort totalPackages = 0;
         ushort packageIndex = 0;
         if (message.Header.IsPackage && message.Header.Package != null)
@@ -522,31 +512,60 @@ public class JT808TcpServer
             packageIndex = message.Header.Package.PackageIndex;
         }
 
+        // ===== 关键: JT808-2019 多媒体分包语义 =====
+        // 单包 (totalPackages<=1) 或首包 (packageIndex<=1):
+        //   body 包含完整 36 字节元数据头 (Mid + Type + Format + Event + ChannelId + Location)
+        // 后续子包 (packageIndex >= 2):
+        //   body 全部是裸多媒体数据, 没有任何元数据头, 不能调用 DecodeMultimediaDataUpload
         try
         {
-            var result = _mediaDataStore.ProcessMedia(
-                message.Header.PhoneNumber, multimedia, totalPackages, packageIndex);
+            MediaProcessResult result;
+            if (totalPackages <= 1 || packageIndex <= 1)
+            {
+                // 单包或首包: 解析元数据头
+                result = _mediaDataStore.ProcessFirstOrSingle(
+                    message.Header.PhoneNumber,
+                    message.Header.SerialNumber,
+                    totalPackages,
+                    packageIndex,
+                    message.Body);
+            }
+            else
+            {
+                // 后续子包: 直接传裸 body
+                result = _mediaDataStore.ProcessSubsequent(
+                    message.Header.PhoneNumber,
+                    message.Header.SerialNumber,
+                    totalPackages,
+                    packageIndex,
+                    message.Body);
+            }
 
             if (result.IsComplete)
             {
-                _logger.LogInformation("多媒体保存 {File}", result.FilePath);
+                _logger.LogInformation("多媒体保存 Mid={Mid} -> {File}",
+                    result.MultimediaId, result.FilePath);
                 return JT808Encoder.EncodeMultimediaDataUploadResponse(
-                    message.Header.PhoneNumber, multimedia.MultimediaId, null, session.Is2019Version);
+                    message.Header.PhoneNumber, result.MultimediaId, null, session.Is2019Version);
             }
             if (result.MissingPackageIds.Count > 0)
             {
-                _logger.LogWarning("多媒体漏包 Mid={Mid} 收到={R}/{T}",
-                    multimedia.MultimediaId, result.ReceivedCount, result.TotalCount);
+                _logger.LogWarning("多媒体漏包 Mid={Mid} 收到={R}/{T} 缺={Missing}",
+                    result.MultimediaId, result.ReceivedCount, result.TotalCount,
+                    result.MissingPackageIds.Count);
                 return JT808Encoder.EncodeMultimediaDataUploadResponse(
-                    message.Header.PhoneNumber, multimedia.MultimediaId, result.MissingPackageIds, session.Is2019Version);
+                    message.Header.PhoneNumber, result.MultimediaId,
+                    result.MissingPackageIds, session.Is2019Version);
             }
+            // 静默累积中
             return JT808Encoder.EncodePlatformGeneralResponse(
                 message.Header.PhoneNumber, message.Header.SerialNumber,
                 message.Header.MessageId, (byte)CommonResult.Success, session.Is2019Version);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "保存多媒体失败");
+            _logger.LogError(ex, "处理多媒体上传失败 Phone={Phone} Serial={Serial} Idx={Idx}/{Tot}",
+                message.Header.PhoneNumber, message.Header.SerialNumber, packageIndex, totalPackages);
             return JT808Encoder.EncodePlatformGeneralResponse(
                 message.Header.PhoneNumber, message.Header.SerialNumber,
                 message.Header.MessageId, (byte)CommonResult.Failure, session.Is2019Version);
