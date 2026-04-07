@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 using JT808.Protocol;
@@ -6,7 +7,13 @@ using Microsoft.Extensions.Logging;
 namespace JT808.Server;
 
 /// <summary>
-/// JT808-2019 TCP服务器(支持10000+并发连接)
+/// JT808-2019 TCP服务器 — 高并发优化版 (10K+ 终端)
+/// 关键设计:
+///   1. 每个 Session 持有复用的 SocketAsyncEventArgs + ArrayPool 缓冲区, 零分配热路径
+///   2. 接收回调内联处理消息 (不用 Task.Run, 避免 ThreadPool 抖动)
+///   3. 同一 Socket 的发送由 per-session lock 串行化, 防止并发 Send 错乱
+///   4. 热路径只用 LogDebug + IsEnabled 检查, Information 仅在状态变化时输出
+///   5. 连接数硬上限保护 + 单文件 PeriodicTimer 清理
 /// </summary>
 public class JT808TcpServer
 {
@@ -14,35 +21,45 @@ public class JT808TcpServer
     private readonly SessionManager _sessionManager;
     private readonly LocationDataStore _locationDataStore;
     private readonly MediaDataStore _mediaDataStore;
+
     private Socket? _serverSocket;
-    private bool _isRunning;
+    private SocketAsyncEventArgs? _acceptArgs;
+    private volatile bool _isRunning;
+    private PeriodicTimer? _cleanupTimer;
+
     private readonly string _ipAddress;
     private readonly int _port;
     private readonly int _backlog;
+    private readonly int _maxConcurrentConnections;
     private readonly int _sessionTimeoutMinutes;
+
+    // 每个 session 的接收缓冲区大小
+    private const int ReceiveBufferSize = 4096;
+
+    private static readonly ArrayPool<byte> BufferPool = ArrayPool<byte>.Shared;
 
     public JT808TcpServer(
         ILogger<JT808TcpServer> logger,
         string ipAddress = "0.0.0.0",
         int port = 8809,
-        int backlog = 10000,
+        int backlog = 4096,
+        int maxConcurrentConnections = 12000,
         string locationDataDir = "LocationData",
+        string? locationArchiveDir = null,
         string mediaDataDir = "MediaData",
         int sessionTimeoutMinutes = 30)
     {
         _logger = logger;
         _sessionManager = new SessionManager();
-        _locationDataStore = new LocationDataStore(locationDataDir);
+        _locationDataStore = new LocationDataStore(locationDataDir, locationArchiveDir);
         _mediaDataStore = new MediaDataStore(mediaDataDir);
         _ipAddress = ipAddress;
         _port = port;
         _backlog = backlog;
+        _maxConcurrentConnections = maxConcurrentConnections;
         _sessionTimeoutMinutes = sessionTimeoutMinutes;
     }
 
-    /// <summary>
-    /// 启动服务器
-    /// </summary>
     public void Start()
     {
         if (_isRunning)
@@ -54,25 +71,26 @@ public class JT808TcpServer
         try
         {
             _serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-
-            // 设置Socket选项以支持高并发
             _serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            _serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
 
-            // 解析配置的IP地址
             var ipAddr = _ipAddress == "0.0.0.0" ? IPAddress.Any : IPAddress.Parse(_ipAddress);
-            var endPoint = new IPEndPoint(ipAddr, _port);
-            _serverSocket.Bind(endPoint);
+            _serverSocket.Bind(new IPEndPoint(ipAddr, _port));
             _serverSocket.Listen(_backlog);
 
             _isRunning = true;
-            _logger.LogInformation($"JT808-2019服务器启动成功,监听地址: {_ipAddress}:{_port}");
+            _logger.LogInformation("JT808-2019 服务器启动成功, 监听 {Addr}:{Port}, backlog={Backlog}, maxConn={MaxConn}",
+                _ipAddress, _port, _backlog, _maxConcurrentConnections);
 
-            // 启动清理超时会话的定时任务
-            Task.Run(CleanupTask);
+            // 复用单个 accept SAEA
+            _acceptArgs = new SocketAsyncEventArgs();
+            _acceptArgs.Completed += OnAcceptCompleted;
 
-            // 开始接受连接
-            BeginAccept();
+            // 启动周期清理任务 — fire-and-forget
+            // PeriodicTimer.Dispose() (在 Stop 中) 会让 WaitForNextTickAsync 抛 OperationCanceledException, worker 自动退出
+            _cleanupTimer = new PeriodicTimer(TimeSpan.FromSeconds(60));
+            _ = Task.Run(CleanupLoopAsync);
+
+            StartAccept();
         }
         catch (Exception ex)
         {
@@ -81,19 +99,25 @@ public class JT808TcpServer
         }
     }
 
-    /// <summary>
-    /// 停止服务器
-    /// </summary>
     public void Stop()
     {
-        if (!_isRunning)
-            return;
-
+        if (!_isRunning) return;
         _isRunning = false;
 
         try
         {
+            _cleanupTimer?.Dispose();
+            _cleanupTimer = null;
             _serverSocket?.Close();
+            _serverSocket = null;
+            _acceptArgs?.Dispose();
+            _acceptArgs = null;
+
+            // 关闭所有会话
+            foreach (var s in _sessionManager.GetAllSessions().ToList())
+            {
+                _sessionManager.RemoveSession(s.SessionId);
+            }
             _logger.LogInformation("服务器已停止");
         }
         catch (Exception ex)
@@ -102,42 +126,32 @@ public class JT808TcpServer
         }
     }
 
-    /// <summary>
-    /// 开始接受连接
-    /// </summary>
-    private void BeginAccept()
+    // ============================================================
+    //                          ACCEPT
+    // ============================================================
+    private void StartAccept()
     {
-        if (!_isRunning || _serverSocket == null)
-            return;
+        if (!_isRunning || _serverSocket == null || _acceptArgs == null) return;
 
+        _acceptArgs.AcceptSocket = null; // 必须复位, 否则 AcceptAsync 会失败
         try
         {
-            var args = new SocketAsyncEventArgs();
-            args.Completed += OnAcceptCompleted;
-
-            if (!_serverSocket.AcceptAsync(args))
+            if (!_serverSocket.AcceptAsync(_acceptArgs))
             {
-                ProcessAccept(args);
+                ProcessAccept(_acceptArgs);
             }
         }
+        catch (ObjectDisposedException) { /* server stopped */ }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "接受连接时发生错误");
-            BeginAccept(); // 继续接受新连接
+            _logger.LogError(ex, "AcceptAsync 异常");
+            // 发生异常仍尝试继续接受
+            if (_isRunning) StartAccept();
         }
     }
 
-    /// <summary>
-    /// 接受连接完成回调
-    /// </summary>
-    private void OnAcceptCompleted(object? sender, SocketAsyncEventArgs args)
-    {
-        ProcessAccept(args);
-    }
+    private void OnAcceptCompleted(object? sender, SocketAsyncEventArgs args) => ProcessAccept(args);
 
-    /// <summary>
-    /// 处理接受的连接
-    /// </summary>
     private void ProcessAccept(SocketAsyncEventArgs args)
     {
         try
@@ -145,183 +159,222 @@ public class JT808TcpServer
             if (args.SocketError == SocketError.Success && args.AcceptSocket != null)
             {
                 var clientSocket = args.AcceptSocket;
-                var remoteEndPoint = clientSocket.RemoteEndPoint?.ToString() ?? "Unknown";
 
-                // 创建会话
-                var session = _sessionManager.AddSession(clientSocket);
-                _logger.LogInformation($"新连接: {remoteEndPoint}, SessionId: {session.SessionId}, 当前在线: {_sessionManager.GetOnlineCount()}");
+                // —— 连接数上限保护 ——
+                int online = _sessionManager.GetOnlineCount();
+                if (online >= _maxConcurrentConnections)
+                {
+                    _logger.LogWarning("达到最大连接数 {Max}, 拒绝新连接", _maxConcurrentConnections);
+                    try { clientSocket.Close(); } catch { }
+                }
+                else
+                {
+                    // —— Socket 调优 ——
+                    try
+                    {
+                        clientSocket.NoDelay = true;
+                        clientSocket.SendTimeout = 5000;
+                        clientSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                    }
+                    catch { }
 
-                // 开始接收数据
-                BeginReceive(session);
+                    var session = _sessionManager.AddSession(clientSocket);
+
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                    {
+                        _logger.LogDebug("新连接 {EP}, Sid={Sid}, 在线={Cnt}",
+                            clientSocket.RemoteEndPoint, session.SessionId, online + 1);
+                    }
+
+                    // 给会话分配复用的接收 SAEA + 池化 buffer
+                    StartReceive(session);
+                }
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "处理连接时发生错误");
+            _logger.LogError(ex, "ProcessAccept 异常");
         }
         finally
         {
-            args.Dispose();
-            // 继续接受新连接
-            BeginAccept();
+            // 立即接受下一个连接
+            if (_isRunning) StartAccept();
         }
     }
 
-    /// <summary>
-    /// 开始接收数据
-    /// </summary>
-    private void BeginReceive(SessionInfo session)
+    // ============================================================
+    //                          RECEIVE
+    // ============================================================
+    private void StartReceive(SessionInfo session)
     {
         try
         {
+            // 租用复用的 buffer 和 SAEA
+            var buffer = BufferPool.Rent(ReceiveBufferSize);
             var args = new SocketAsyncEventArgs();
             args.UserToken = session;
-            args.SetBuffer(new byte[2048], 0, 2048);
+            args.SetBuffer(buffer, 0, buffer.Length);
             args.Completed += OnReceiveCompleted;
 
-            if (!session.Socket.ReceiveAsync(args))
-            {
-                ProcessReceive(args);
-            }
+            session.ReceiveBuffer = buffer;
+            session.ReceiveArgs = args;
+
+            DoReceive(session, args);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, $"开始接收数据时发生错误, SessionId: {session.SessionId}");
+            _logger.LogError(ex, "StartReceive 异常, Sid={Sid}", session.SessionId);
             _sessionManager.RemoveSession(session.SessionId);
         }
     }
 
-    /// <summary>
-    /// 接收数据完成回调
-    /// </summary>
+    private void DoReceive(SessionInfo session, SocketAsyncEventArgs args)
+    {
+        if (session.IsClosed) return;
+        try
+        {
+            // 关键: 每次都重置到 buffer 起点 (修复原版 offset 累加 bug)
+            args.SetBuffer(0, ReceiveBufferSize);
+            if (!session.Socket.ReceiveAsync(args))
+            {
+                // 同步完成 — 立即处理 (用 while 循环防止深递归栈溢出)
+                ProcessReceiveSync(args);
+            }
+        }
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug(ex, "DoReceive 异常, Sid={Sid}", session.SessionId);
+            _sessionManager.RemoveSession(session.SessionId);
+        }
+    }
+
+    /// <summary>同步完成路径 — 用循环避免递归栈溢出</summary>
+    private void ProcessReceiveSync(SocketAsyncEventArgs args)
+    {
+        while (true)
+        {
+            var session = (SessionInfo)args.UserToken!;
+            if (!HandleReceiveOnce(session, args)) return;
+
+            // 继续接收
+            args.SetBuffer(0, ReceiveBufferSize);
+            try
+            {
+                if (session.Socket.ReceiveAsync(args)) return; // 进入异步等待
+            }
+            catch (ObjectDisposedException) { return; }
+            catch
+            {
+                _sessionManager.RemoveSession(session.SessionId);
+                return;
+            }
+        }
+    }
+
     private void OnReceiveCompleted(object? sender, SocketAsyncEventArgs args)
     {
-        ProcessReceive(args);
+        var session = (SessionInfo)args.UserToken!;
+        if (!HandleReceiveOnce(session, args)) return;
+        DoReceive(session, args);
     }
 
     /// <summary>
-    /// 处理接收的数据
+    /// 处理一次接收 — 返回 true 表示继续, false 表示连接已断开
     /// </summary>
-    private void ProcessReceive(SocketAsyncEventArgs args)
+    private bool HandleReceiveOnce(SessionInfo session, SocketAsyncEventArgs args)
     {
-        var session = args.UserToken as SessionInfo;
-        if (session == null)
+        if (args.SocketError != SocketError.Success || args.BytesTransferred <= 0)
         {
-            args.Dispose();
-            return;
+            // 对端关闭或错误
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("连接断开 Sid={Sid} Phone={Phone} Err={Err}",
+                    session.SessionId, session.PhoneNumber, args.SocketError);
+            _sessionManager.RemoveSession(session.SessionId);
+            return false;
         }
 
         try
         {
-            if (args.SocketError == SocketError.Success && args.BytesTransferred > 0)
+            // 直接把 args.Buffer 的有效片段塞进消息缓冲区
+            session.MessageBuffer.Append(args.Buffer!, args.Offset, args.BytesTransferred);
+
+            // 提取所有完整消息
+            var messages = session.MessageBuffer.ExtractMessages();
+
+            session.TouchActive();
+
+            // —— 内联处理 — 不用 Task.Run, 避免 ThreadPool 抖动 ——
+            for (int i = 0; i < messages.Count; i++)
             {
-                // 获取接收到的数据
-                var receivedData = new byte[args.BytesTransferred];
-                Buffer.BlockCopy(args.Buffer!, args.Offset, receivedData, 0, args.BytesTransferred);
-
-                // 添加到消息缓冲区
-                session.MessageBuffer.Append(receivedData);
-
-                // 从缓冲区提取完整消息
-                var messages = session.MessageBuffer.ExtractMessages();
-
-                // 更新会话活跃时间
-                _sessionManager.UpdateActiveTime(session.SessionId);
-
-                // 处理每个完整消息
-                foreach (var message in messages)
-                {
-                    session.ReceivedMessages++;
-                    Task.Run(() => ProcessMessage(session, message));
-                }
-
-                // 继续接收
-                args.SetBuffer(args.Offset, args.Buffer!.Length - args.Offset);
-                if (!session.Socket.ReceiveAsync(args))
-                {
-                    ProcessReceive(args);
-                }
+                session.IncReceived();
+                ProcessMessage(session, messages[i]);
             }
-            else
-            {
-                // 连接断开
-                _logger.LogInformation($"连接断开: SessionId: {session.SessionId}, 手机号: {session.PhoneNumber}");
-                _sessionManager.RemoveSession(session.SessionId);
-                args.Dispose();
-            }
+            return true;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, $"处理接收数据时发生错误, SessionId: {session.SessionId}");
+            _logger.LogError(ex, "HandleReceiveOnce 异常 Sid={Sid}", session.SessionId);
             _sessionManager.RemoveSession(session.SessionId);
-            args.Dispose();
+            return false;
         }
     }
 
-    /// <summary>
-    /// 处理消息
-    /// </summary>
+    // ============================================================
+    //                          MESSAGE PROCESSING
+    // ============================================================
     private void ProcessMessage(SessionInfo session, byte[] data)
     {
         try
         {
-            // 解码消息
             var message = JT808Decoder.Decode(data);
             if (message == null)
             {
-                _logger.LogWarning($"消息解码失败, SessionId: {session.SessionId}");
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("消息解码失败 Sid={Sid}", session.SessionId);
                 return;
             }
 
-            // 检测协议版本
+            // 检测协议版本 (仅状态变化时打日志)
             if (message.Header.Is2019Version && !session.Is2019Version)
             {
                 session.Is2019Version = true;
                 session.ProtocolVersion = message.Header.ProtocolVersion;
-                _logger.LogInformation($"检测到2019版本协议, 版本号: {session.ProtocolVersion}, SessionId: {session.SessionId}");
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("检测到2019版本 Sid={Sid} Ver={V}", session.SessionId, session.ProtocolVersion);
             }
 
-            _logger.LogInformation($"收到消息: MsgId=0x{message.Header.MessageId:X4}, " +
-                                 $"Phone={message.Header.PhoneNumber}, Serial={message.Header.SerialNumber}, " +
-                                 $"Version={message.Header.ProtocolVersion}");
-
-            // 绑定手机号
+            // 绑定手机号 (仅首次)
             if (string.IsNullOrEmpty(session.PhoneNumber) && !string.IsNullOrEmpty(message.Header.PhoneNumber))
             {
                 _sessionManager.BindPhoneNumber(session.SessionId, message.Header.PhoneNumber);
             }
 
-            // 根据消息ID处理
             byte[]? response = null;
             switch (message.Header.MessageId)
             {
                 case JT808MessageId.TerminalRegister:
                     response = HandleRegister(session, message);
                     break;
-
                 case JT808MessageId.TerminalAuthentication:
                     response = HandleAuthentication(session, message);
                     break;
-
                 case JT808MessageId.TerminalHeartbeat:
                     response = HandleHeartbeat(session, message);
                     break;
-
                 case JT808MessageId.LocationReport:
                     response = HandleLocationReport(session, message);
                     break;
-
                 case JT808MessageId.LocationBatchUpload:
                     response = HandleLocationBatchUpload(session, message);
                     break;
-
                 case JT808MessageId.MultimediaDataUpload:
                     response = HandleMultimediaDataUpload(session, message);
                     break;
-
                 default:
-                    _logger.LogWarning($"未处理的消息类型: 0x{message.Header.MessageId:X4}");
-                    // 返回通用应答-不支持
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("未处理消息 0x{Id:X4}", message.Header.MessageId);
                     response = JT808Encoder.EncodePlatformGeneralResponse(
                         message.Header.PhoneNumber,
                         message.Header.SerialNumber,
@@ -331,7 +384,6 @@ public class JT808TcpServer
                     break;
             }
 
-            // 发送应答
             if (response != null)
             {
                 SendData(session, response);
@@ -339,31 +391,26 @@ public class JT808TcpServer
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, $"处理消息时发生错误, SessionId: {session.SessionId}");
+            _logger.LogError(ex, "ProcessMessage 异常 Sid={Sid}", session.SessionId);
         }
     }
 
-    /// <summary>
-    /// 处理终端注册
-    /// </summary>
     private byte[] HandleRegister(SessionInfo session, JT808Message message)
     {
         var registerInfo = JT808Decoder.DecodeRegisterInfo(message.Body);
         if (registerInfo != null)
         {
-            _logger.LogInformation($"终端注册: 手机号={message.Header.PhoneNumber}, " +
-                                 $"车牌={registerInfo.PlateNumber}, 终端ID={registerInfo.TerminalId}, " +
-                                 $"制造商={registerInfo.ManufacturerId}, 型号={registerInfo.TerminalModel}");
+            // 注册是状态事件, 用 Information
+            _logger.LogInformation("终端注册 Phone={Phone} Plate={Plate} Term={Term} Mfr={Mfr}",
+                message.Header.PhoneNumber, registerInfo.PlateNumber,
+                registerInfo.TerminalId, registerInfo.ManufacturerId);
 
-            // 保存终端信息
             session.TerminalModel = registerInfo.TerminalModel;
             session.PlateNumber = registerInfo.PlateNumber;
 
-            // 生成鉴权码(实际应用中应该存储到数据库)
-            string authCode = Guid.NewGuid().ToString("N").Substring(0, 20); // 2019版本最长50字节
+            string authCode = Guid.NewGuid().ToString("N").Substring(0, 20);
             _sessionManager.SetAuthenticated(session.SessionId, false, authCode);
 
-            // 返回注册应答
             return JT808Encoder.EncodeRegisterResponse(
                 message.Header.PhoneNumber,
                 message.Header.SerialNumber,
@@ -380,23 +427,17 @@ public class JT808TcpServer
             session.Is2019Version);
     }
 
-    /// <summary>
-    /// 处理终端鉴权 (2019版本)
-    /// </summary>
     private byte[] HandleAuthentication(SessionInfo session, JT808Message message)
     {
         var authInfo = JT808Decoder.DecodeAuthenticationInfo(message.Body);
         if (authInfo != null)
         {
-            _logger.LogInformation($"终端鉴权: 手机号={message.Header.PhoneNumber}, " +
-                                 $"IMEI={authInfo.IMEI}, 软件版本={authInfo.SoftwareVersion}");
-
-            // 保存终端信息 (2019新增)
+            _logger.LogInformation("终端鉴权 Phone={Phone} IMEI={IMEI} SwVer={Sw}",
+                message.Header.PhoneNumber, authInfo.IMEI, authInfo.SoftwareVersion);
             session.IMEI = authInfo.IMEI;
             session.SoftwareVersion = authInfo.SoftwareVersion;
         }
 
-        // 标记为已鉴权(实际应用中应该验证鉴权码)
         _sessionManager.SetAuthenticated(session.SessionId, true);
 
         return JT808Encoder.EncodePlatformGeneralResponse(
@@ -407,13 +448,9 @@ public class JT808TcpServer
             session.Is2019Version);
     }
 
-    /// <summary>
-    /// 处理心跳
-    /// </summary>
     private byte[] HandleHeartbeat(SessionInfo session, JT808Message message)
     {
-        _logger.LogDebug($"收到心跳: 手机号={message.Header.PhoneNumber}");
-
+        // 心跳频率最高, 完全不打日志
         return JT808Encoder.EncodePlatformGeneralResponse(
             message.Header.PhoneNumber,
             message.Header.SerialNumber,
@@ -422,38 +459,24 @@ public class JT808TcpServer
             session.Is2019Version);
     }
 
-    /// <summary>
-    /// 处理位置上报
-    /// </summary>
     private byte[] HandleLocationReport(SessionInfo session, JT808Message message)
     {
         var location = JT808Decoder.DecodeLocationInfo(message.Body);
         if (location != null)
         {
-            var additionalInfo = location.AdditionalInfoList.Count > 0
-                ? $", 附加信息: {location.AdditionalInfoList.Count}项"
-                : "";
-
-            _logger.LogInformation($"位置上报: 手机号={message.Header.PhoneNumber}, " +
-                                 $"车牌={session.PlateNumber ?? "未知"}, " +
-                                 $"经度={location.GetLongitude():F6}, 纬度={location.GetLatitude():F6}, " +
-                                 $"速度={location.GetSpeed():F1}km/h, 时间={location.GpsTime:yyyy-MM-dd HH:mm:ss}, " +
-                                 $"ACC={(location.IsAccOn ? "开" : "关")}, 定位={(location.IsPositioned ? "是" : "否")}" +
-                                 additionalInfo);
-
-            // 保存位置数据到文件（以车牌号为文件名）
-            try
+            // 位置上报是次高频, 只在 Debug 级别打日志
+            if (_logger.IsEnabled(LogLevel.Debug))
             {
-                _locationDataStore.SaveLocation(
-                    session.PlateNumber ?? string.Empty,
-                    message.Header.PhoneNumber,
-                    location);
-                _logger.LogDebug($"位置数据已保存: 车牌={session.PlateNumber ?? message.Header.PhoneNumber}");
+                _logger.LogDebug("位置 Phone={Phone} Plate={Plate} Lon={Lon:F6} Lat={Lat:F6} Spd={Spd:F1}",
+                    message.Header.PhoneNumber, session.PlateNumber ?? "-",
+                    location.GetLongitude(), location.GetLatitude(), location.GetSpeed());
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "保存位置数据失败");
-            }
+
+            // 异步入队 — 非阻塞
+            _locationDataStore.SaveLocation(
+                session.PlateNumber ?? string.Empty,
+                message.Header.PhoneNumber,
+                location);
         }
 
         return JT808Encoder.EncodePlatformGeneralResponse(
@@ -464,14 +487,11 @@ public class JT808TcpServer
             session.Is2019Version);
     }
 
-    /// <summary>
-    /// 处理批量位置上传
-    /// </summary>
     private byte[] HandleLocationBatchUpload(SessionInfo session, JT808Message message)
     {
-        _logger.LogInformation($"批量位置上传: 手机号={message.Header.PhoneNumber}, 数据长度={message.Body.Length}");
-
-        // TODO: 解析批量位置数据
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("批量位置上传 Phone={Phone} Len={Len}",
+                message.Header.PhoneNumber, message.Body.Length);
 
         return JT808Encoder.EncodePlatformGeneralResponse(
             message.Header.PhoneNumber,
@@ -481,9 +501,6 @@ public class JT808TcpServer
             session.Is2019Version);
     }
 
-    /// <summary>
-    /// 处理多媒体数据上传 (0x0801)
-    /// </summary>
     private byte[] HandleMultimediaDataUpload(SessionInfo session, JT808Message message)
     {
         var multimedia = JT808Decoder.DecodeMultimediaDataUpload(message.Body);
@@ -497,150 +514,124 @@ public class JT808TcpServer
                 session.Is2019Version);
         }
 
-        // 获取分包信息
         ushort totalPackages = 0;
         ushort packageIndex = 0;
-
         if (message.Header.IsPackage && message.Header.Package != null)
         {
             totalPackages = message.Header.Package.TotalPackage;
             packageIndex = message.Header.Package.PackageIndex;
-
-            _logger.LogInformation($"多媒体数据上传(分包): 手机号={message.Header.PhoneNumber}, " +
-                                 $"多媒体ID={multimedia.MultimediaId}, " +
-                                 $"类型={multimedia.GetTypeName()}, " +
-                                 $"格式={multimedia.Format}, " +
-                                 $"分包={packageIndex}/{totalPackages}, " +
-                                 $"数据大小={multimedia.Data.Length}字节");
-        }
-        else
-        {
-            _logger.LogInformation($"多媒体数据上传: 手机号={message.Header.PhoneNumber}, " +
-                                 $"多媒体ID={multimedia.MultimediaId}, " +
-                                 $"类型={multimedia.GetTypeName()}, " +
-                                 $"格式={multimedia.Format}, " +
-                                 $"通道={multimedia.ChannelId}, " +
-                                 $"数据大小={multimedia.Data.Length}字节");
         }
 
-        // 处理多媒体数据（支持分包组装和漏包检测）
         try
         {
             var result = _mediaDataStore.ProcessMedia(
-                message.Header.PhoneNumber,
-                multimedia,
-                totalPackages,
-                packageIndex);
+                message.Header.PhoneNumber, multimedia, totalPackages, packageIndex);
 
             if (result.IsComplete)
             {
-                // 数据完整，保存成功
-                _logger.LogInformation($"多媒体文件已保存: {result.FilePath}");
-
-                // 发送 0x8800 多媒体数据上传应答（无需重传）
+                _logger.LogInformation("多媒体保存 {File}", result.FilePath);
                 return JT808Encoder.EncodeMultimediaDataUploadResponse(
-                    message.Header.PhoneNumber,
-                    multimedia.MultimediaId,
-                    null,
-                    session.Is2019Version);
+                    message.Header.PhoneNumber, multimedia.MultimediaId, null, session.Is2019Version);
             }
-            else if (result.MissingPackageIds.Count > 0)
+            if (result.MissingPackageIds.Count > 0)
             {
-                // 有漏包，发送重传请求
-                _logger.LogWarning($"多媒体数据漏包: 多媒体ID={multimedia.MultimediaId}, " +
-                                  $"已收到={result.ReceivedCount}/{result.TotalCount}, " +
-                                  $"漏包={string.Join(",", result.MissingPackageIds)}");
-
-                // 发送 0x8800 多媒体数据上传应答（带重传包ID列表）
+                _logger.LogWarning("多媒体漏包 Mid={Mid} 收到={R}/{T}",
+                    multimedia.MultimediaId, result.ReceivedCount, result.TotalCount);
                 return JT808Encoder.EncodeMultimediaDataUploadResponse(
-                    message.Header.PhoneNumber,
-                    multimedia.MultimediaId,
-                    result.MissingPackageIds,
-                    session.Is2019Version);
+                    message.Header.PhoneNumber, multimedia.MultimediaId, result.MissingPackageIds, session.Is2019Version);
             }
-            else
-            {
-                // 分包已缓存，等待更多分包
-                _logger.LogDebug($"多媒体分包已缓存: {result.ReceivedCount}/{result.TotalCount}");
-
-                // 返回通用应答确认收到
-                return JT808Encoder.EncodePlatformGeneralResponse(
-                    message.Header.PhoneNumber,
-                    message.Header.SerialNumber,
-                    message.Header.MessageId,
-                    (byte)CommonResult.Success,
-                    session.Is2019Version);
-            }
+            return JT808Encoder.EncodePlatformGeneralResponse(
+                message.Header.PhoneNumber, message.Header.SerialNumber,
+                message.Header.MessageId, (byte)CommonResult.Success, session.Is2019Version);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "保存多媒体数据失败");
+            _logger.LogError(ex, "保存多媒体失败");
             return JT808Encoder.EncodePlatformGeneralResponse(
-                message.Header.PhoneNumber,
-                message.Header.SerialNumber,
-                message.Header.MessageId,
-                (byte)CommonResult.Failure,
-                session.Is2019Version);
+                message.Header.PhoneNumber, message.Header.SerialNumber,
+                message.Header.MessageId, (byte)CommonResult.Failure, session.Is2019Version);
         }
     }
 
+    // ============================================================
+    //                          SEND
+    // ============================================================
     /// <summary>
-    /// 发送数据
+    /// 同步发送 + per-session 串行锁
+    /// JT808 应答包很小 (<100 字节), 内核 send buffer 会立即吸收, sync send 完全够用
+    /// SendTimeout=5s 作为慢客户端的兜底
     /// </summary>
     private void SendData(SessionInfo session, byte[] data)
     {
+        if (session.IsClosed) return;
+
         try
         {
-            var args = new SocketAsyncEventArgs();
-            args.SetBuffer(data, 0, data.Length);
-            args.Completed += (sender, e) => e.Dispose();
-
-            if (!session.Socket.SendAsync(args))
+            lock (session.SendLock)
             {
-                args.Dispose();
+                if (session.IsClosed) return;
+                int total = 0;
+                while (total < data.Length)
+                {
+                    int sent = session.Socket.Send(data, total, data.Length - total, SocketFlags.None);
+                    if (sent <= 0) break;
+                    total += sent;
+                }
             }
-
-            session.SentMessages++;
+            session.IncSent();
+        }
+        catch (SocketException sex)
+        {
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Send 失败 Sid={Sid} Err={Err}", session.SessionId, sex.SocketErrorCode);
+            _sessionManager.RemoveSession(session.SessionId);
+        }
+        catch (ObjectDisposedException)
+        {
+            _sessionManager.RemoveSession(session.SessionId);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, $"发送数据失败, SessionId: {session.SessionId}");
+            _logger.LogError(ex, "Send 异常 Sid={Sid}", session.SessionId);
+            _sessionManager.RemoveSession(session.SessionId);
         }
     }
 
-    /// <summary>
-    /// 清理超时会话定时任务
-    /// </summary>
-    private async Task CleanupTask()
+    // ============================================================
+    //                          CLEANUP LOOP
+    // ============================================================
+    private async Task CleanupLoopAsync()
     {
-        while (_isRunning)
+        var timer = _cleanupTimer;
+        if (timer == null) return;
+
+        try
         {
-            try
+            while (await timer.WaitForNextTickAsync().ConfigureAwait(false))
             {
-                await Task.Delay(TimeSpan.FromMinutes(5));
-                _sessionManager.CleanupTimeoutSessions(_sessionTimeoutMinutes);
+                if (!_isRunning) break;
+                try
+                {
+                    int removed = _sessionManager.CleanupTimeoutSessions(_sessionTimeoutMinutes);
+                    int online = _sessionManager.GetOnlineCount();
+                    int pending = _locationDataStore.PendingCount;
 
-                var onlineCount = _sessionManager.GetOnlineCount();
-                var sessions = _sessionManager.GetAllSessions();
-                var authenticatedCount = sessions.Count(s => s.IsAuthenticated);
-                var version2019Count = sessions.Count(s => s.Is2019Version);
-
-                _logger.LogInformation($"在线终端数: {onlineCount}, 已鉴权: {authenticatedCount}, 2019版本: {version2019Count}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "清理会话时发生错误");
+                    _logger.LogInformation(
+                        "[Stats] 在线={Online} 清理超时={Removed} 待写位置={Pending}",
+                        online, removed, pending);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "CleanupLoop 异常");
+                }
             }
         }
+        catch (OperationCanceledException) { }
     }
 
-    /// <summary>
-    /// 获取会话管理器
-    /// </summary>
+    // ============================================================
+    //                          PUBLIC API
+    // ============================================================
     public SessionManager GetSessionManager() => _sessionManager;
-
-    /// <summary>
-    /// 获取位置数据存储器
-    /// </summary>
     public LocationDataStore GetLocationDataStore() => _locationDataStore;
 }

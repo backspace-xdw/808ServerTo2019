@@ -58,3 +58,8 @@ artifacts/
 # Test logs
 /tmp/
 *.log
+
+# 运行时生成的数据目录
+LocationData/
+LocationArchive/
+MediaData/

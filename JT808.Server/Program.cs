@@ -32,32 +32,42 @@ var server = new JT808TcpServer(
     logger,
     ipAddress: serverConfig.IpAddress,
     port: serverConfig.Port,
-    backlog: serverConfig.MaxConnections,
+    backlog: serverConfig.Backlog,
+    maxConcurrentConnections: serverConfig.MaxConcurrentConnections,
     locationDataDir: serverConfig.LocationDataDirectory,
+    locationArchiveDir: serverConfig.LocationArchiveDirectory,
     mediaDataDir: serverConfig.MediaDataDirectory,
     sessionTimeoutMinutes: serverConfig.SessionTimeoutMinutes);
 
 Console.WriteLine("=".PadRight(60, '='));
 Console.WriteLine("JT808-2019 车载终端通讯服务器");
 Console.WriteLine("基于 JT/T 808-2019 协议");
-Console.WriteLine($"支持 {serverConfig.MaxConnections}+ 并发连接");
+Console.WriteLine($"支持 {serverConfig.MaxConcurrentConnections}+ 并发连接 (高并发优化版)");
 Console.WriteLine("支持 2013 和 2019 版本自动识别");
 Console.WriteLine("=".PadRight(60, '='));
 Console.WriteLine();
 Console.WriteLine("当前配置:");
-Console.WriteLine($"  监听地址: {serverConfig.IpAddress}:{serverConfig.Port}");
-Console.WriteLine($"  位置目录: {serverConfig.LocationDataDirectory}");
-Console.WriteLine($"  媒体目录: {serverConfig.MediaDataDirectory}");
-Console.WriteLine($"  会话超时: {serverConfig.SessionTimeoutMinutes} 分钟");
-Console.WriteLine($"  日志级别: {serverConfig.LogLevel}");
+Console.WriteLine($"  监听地址:       {serverConfig.IpAddress}:{serverConfig.Port}");
+Console.WriteLine($"  Listen Backlog: {serverConfig.Backlog}");
+Console.WriteLine($"  最大并发连接:   {serverConfig.MaxConcurrentConnections}");
+Console.WriteLine($"  位置目录:       {serverConfig.LocationDataDirectory}");
+Console.WriteLine($"  位置归档:       {(string.IsNullOrWhiteSpace(serverConfig.LocationArchiveDirectory) ? "(未启用)" : serverConfig.LocationArchiveDirectory + "/yyyyMMdd/")}");
+Console.WriteLine($"  媒体目录:       {serverConfig.MediaDataDirectory}");
+Console.WriteLine($"  会话超时:       {serverConfig.SessionTimeoutMinutes} 分钟");
+Console.WriteLine($"  日志级别:       {serverConfig.LogLevel}");
+Console.WriteLine();
+Console.WriteLine("提示: 高并发场景请确认系统配置:");
+Console.WriteLine("  ulimit -n 65536                              # fd 上限");
+Console.WriteLine("  sysctl -w net.core.somaxconn=8192            # listen 队列");
+Console.WriteLine("  sysctl -w net.ipv4.tcp_max_syn_backlog=8192  # syn 队列");
 Console.WriteLine();
 
 try
 {
     server.Start();
 
-    // 检查是否在后台运行
-    bool isBackgroundMode = Console.IsInputRedirected || !Console.KeyAvailable;
+    // 检查是否在后台运行 (systemd / docker / nohup 等场景下 stdin 会被重定向)
+    bool isBackgroundMode = Console.IsInputRedirected;
 
     if (isBackgroundMode)
     {
@@ -132,7 +142,7 @@ static void ShowStatistics(JT808TcpServer server)
                          $"{(session.IsAuthenticated ? "是" : "否"),-6} " +
                          $"{session.ReceivedMessages}/{session.SentMessages,-15} " +
                          $"{imei,-18} " +
-                         $"{session.LastActiveTime:yyyy-MM-dd HH:mm:ss,-20}");
+                         $"{session.LastActiveTime,-20:yyyy-MM-dd HH:mm:ss}");
     }
 
     if (sessions.Count > 15)

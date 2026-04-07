@@ -20,6 +20,27 @@ public class JT808MessageBuffer
     }
 
     /// <summary>
+    /// 添加接收到的数据 (片段) — 用于复用接收 buffer 的高并发场景, 避免临时数组分配
+    /// </summary>
+    public void Append(byte[] data, int offset, int count)
+    {
+        if (count <= 0) return;
+        lock (_lock)
+        {
+            // 一次性预扩容, 然后逐字节复制
+            if (_buffer.Capacity < _buffer.Count + count)
+            {
+                _buffer.Capacity = _buffer.Count + count;
+            }
+            int end = offset + count;
+            for (int i = offset; i < end; i++)
+            {
+                _buffer.Add(data[i]);
+            }
+        }
+    }
+
+    /// <summary>
     /// 提取完整的消息
     /// </summary>
     public List<byte[]> ExtractMessages()
