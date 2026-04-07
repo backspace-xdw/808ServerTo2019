@@ -73,6 +73,8 @@ public class SessionManager
 {
     private readonly ConcurrentDictionary<string, SessionInfo> _sessions = new();
     private readonly ConcurrentDictionary<string, string> _phoneToSession = new();
+    // BindPhoneNumber 顶号语义涉及 read-modify-write, 用单独 lock 保证原子性
+    private readonly object _bindLock = new();
     private static readonly ArrayPool<byte> BufferPool = ArrayPool<byte>.Shared;
 
     /// <summary>
@@ -131,29 +133,37 @@ public class SessionManager
 
     /// <summary>
     /// 绑定手机号 — 同手机号顶号上线时, 踢掉旧会话
+    /// 整个 read-modify-write 流程在 _bindLock 内序列化, 防止两个新会话同时绑同一手机号
+    /// 时索引/会话状态不一致
     /// </summary>
     public void BindPhoneNumber(string sessionId, string phoneNumber)
     {
         if (!_sessions.TryGetValue(sessionId, out var session)) return;
-
-        // 已是同一手机号无需处理
         if (session.PhoneNumber == phoneNumber) return;
 
-        // 移除本会话上的旧手机号索引
-        if (!string.IsNullOrEmpty(session.PhoneNumber))
+        lock (_bindLock)
         {
-            _phoneToSession.TryRemove(
-                new KeyValuePair<string, string>(session.PhoneNumber, session.SessionId));
-        }
+            // 拿锁后 re-check, 防止两个线程同时通过外层快速路径
+            if (session.PhoneNumber == phoneNumber) return;
 
-        session.PhoneNumber = phoneNumber;
+            // 移除本会话上的旧手机号索引
+            if (!string.IsNullOrEmpty(session.PhoneNumber))
+            {
+                _phoneToSession.TryRemove(
+                    new KeyValuePair<string, string>(session.PhoneNumber, session.SessionId));
+            }
 
-        // 顶号: 若该手机号已有别的会话, 踢掉它
-        if (_phoneToSession.TryGetValue(phoneNumber, out var oldSid) && oldSid != sessionId)
-        {
-            RemoveSession(oldSid);
+            session.PhoneNumber = phoneNumber;
+
+            // 顶号: 若该手机号已有别的会话, 踢掉它
+            // RemoveSession 不会再调 BindPhoneNumber, 不会重入死锁
+            if (_phoneToSession.TryGetValue(phoneNumber, out var oldSid) && oldSid != sessionId)
+            {
+                RemoveSession(oldSid);
+            }
+
+            _phoneToSession[phoneNumber] = sessionId;
         }
-        _phoneToSession[phoneNumber] = sessionId;
     }
 
     public void SetAuthenticated(string sessionId, bool authenticated, string? authCode = null)

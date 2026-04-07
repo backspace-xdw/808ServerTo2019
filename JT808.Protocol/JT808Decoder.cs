@@ -5,12 +5,16 @@ namespace JT808.Protocol;
 /// <summary>
 /// JT808-2019协议解码器
 /// </summary>
-public class JT808Decoder
+public static class JT808Decoder
 {
+    // 缓存 GBK 编码 (避免每次 ReadString 都查 codepage 表)
+    private static readonly Encoding Gbk;
+
     static JT808Decoder()
     {
         // 注册GBK编码提供程序 (.NET 9需要)
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        Gbk = Encoding.GetEncoding("GBK");
     }
     /// <summary>
     /// 解码消息
@@ -134,7 +138,9 @@ public class JT808Decoder
             }
             catch
             {
-                location.GpsTime = DateTime.Now;
+                // 时间字段损坏: 标记为 MinValue 让下游能识别失真,
+                // 不再静默回退到 DateTime.Now (会让坏数据看起来正常)
+                location.GpsTime = DateTime.MinValue;
             }
         }
 
@@ -309,7 +315,7 @@ public class JT808Decoder
 
     private static string ReadString(byte[] buffer, ref int offset, int length)
     {
-        var str = Encoding.GetEncoding("GBK").GetString(buffer, offset, length).TrimEnd('\0');
+        var str = Gbk.GetString(buffer, offset, length).TrimEnd('\0');
         offset += length;
         return str;
     }
@@ -386,7 +392,9 @@ public class JT808Decoder
             }
             catch
             {
-                location.GpsTime = DateTime.Now;
+                // 时间字段损坏: 标记为 MinValue 让下游能识别失真,
+                // 不再静默回退到 DateTime.Now (会让坏数据看起来正常)
+                location.GpsTime = DateTime.MinValue;
             }
         }
 

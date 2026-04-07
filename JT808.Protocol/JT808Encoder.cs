@@ -7,7 +7,9 @@ namespace JT808.Protocol;
 /// </summary>
 public class JT808Encoder
 {
-    private static ushort _serialNumber = 0;
+    // 流水号: 用 int + Interlocked.Increment 保证多线程编码安全
+    // 截断到 ushort 通过 (ushort) cast, 自然 wrap 65535 -> 0
+    private static int _serialNumber = 0;
 
     /// <summary>
     /// 编码消息 (支持2019版本)
@@ -257,6 +259,7 @@ public class JT808Encoder
 
     private static ushort GetNextSerialNumber()
     {
-        return ++_serialNumber;
+        // Interlocked.Increment 原子加 1, 强制转 ushort 自然 wrap
+        return (ushort)Interlocked.Increment(ref _serialNumber);
     }
 }

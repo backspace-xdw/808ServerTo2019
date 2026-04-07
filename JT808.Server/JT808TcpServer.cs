@@ -99,6 +99,12 @@ public class JT808TcpServer
         }
     }
 
+    /// <summary>
+    /// 优雅停机:
+    ///   1. 关闭 listen socket / 取消 accept
+    ///   2. 关闭所有 session 释放 buffer / SAEA
+    ///   3. 等待 LocationDataStore 后台 worker 把 pending 位置数据刷盘
+    /// </summary>
     public void Stop()
     {
         if (!_isRunning) return;
@@ -118,6 +124,18 @@ public class JT808TcpServer
             {
                 _sessionManager.RemoveSession(s.SessionId);
             }
+
+            // 等 LocationDataStore 后台 worker 把 pending 数据刷完盘
+            // (DisposeAsync 内部最多等 3 秒)
+            try
+            {
+                _locationDataStore.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "LocationDataStore 停机刷盘失败");
+            }
+
             _logger.LogInformation("服务器已停止");
         }
         catch (Exception ex)
@@ -250,13 +268,27 @@ public class JT808TcpServer
         }
     }
 
-    /// <summary>同步完成路径 — 用循环避免递归栈溢出</summary>
+    /// <summary>
+    /// 同步完成路径 — 用循环避免递归栈溢出
+    /// 加 MaxSyncIterations 上限防止单个高频客户端长时间独占 IOCP 线程,
+    /// 超过上限后通过 Task.Run 让出 IOCP 线程让其他连接得到处理
+    /// </summary>
+    private const int MaxSyncIterations = 16;
+
     private void ProcessReceiveSync(SocketAsyncEventArgs args)
     {
+        int iterations = 0;
         while (true)
         {
             var session = (SessionInfo)args.UserToken!;
             if (!HandleReceiveOnce(session, args)) return;
+
+            // 同步路径上限到了 — 让出 IOCP 线程, 后续 receive 通过 ThreadPool 调度
+            if (++iterations >= MaxSyncIterations)
+            {
+                _ = Task.Run(() => DoReceive(session, args));
+                return;
+            }
 
             // 继续接收
             args.SetBuffer(0, ReceiveBufferSize);
