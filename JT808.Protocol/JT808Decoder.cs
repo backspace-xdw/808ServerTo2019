@@ -28,15 +28,16 @@ public static class JT808Decoder
         if (data[0] != JT808Constants.FLAG || data[^1] != JT808Constants.FLAG)
             return null;
 
-        // 去除标识位
-        var buffer = new byte[data.Length - 2];
-        Array.Copy(data, 1, buffer, 0, buffer.Length);
+        // 去除标识位 (一次分配; unescape 走原地, 不再二次分配)
+        int innerLen = data.Length - 2;
+        var buffer = new byte[innerLen];
+        Buffer.BlockCopy(data, 1, buffer, 0, innerLen);
 
-        // 反转义
-        buffer = Unescape(buffer);
+        // 原地反转义, 返回有效长度
+        int validLen = UnescapeInPlace(buffer, innerLen);
 
-        // 校验
-        if (!VerifyCheckCode(buffer))
+        // 校验码 (XOR 0..validLen-2)
+        if (!VerifyCheckCode(buffer, validLen))
             return null;
 
         var message = new JT808Message();
@@ -47,15 +48,15 @@ public static class JT808Decoder
 
         // 解析消息体
         int bodyLength = message.Header.BodyLength;
-        if (bodyLength > 0 && offset + bodyLength <= buffer.Length - 1)
+        if (bodyLength > 0 && offset + bodyLength <= validLen - 1)
         {
             message.Body = new byte[bodyLength];
-            Array.Copy(buffer, offset, message.Body, 0, bodyLength);
+            Buffer.BlockCopy(buffer, offset, message.Body, 0, bodyLength);
             offset += bodyLength;
         }
 
-        // 校验码
-        message.CheckCode = buffer[^1];
+        // 校验码 (最后一字节)
+        message.CheckCode = buffer[validLen - 1];
 
         return message;
     }
@@ -175,7 +176,7 @@ public static class JT808Decoder
     /// </summary>
     public static TerminalRegisterInfo? DecodeRegisterInfo(byte[] body)
     {
-        if (body == null || body.Length < 75) // 2+2+11+30+30 = 75
+        if (body == null || body.Length < 76) // 2+2+11+30+30+1 = 76 (含 PlateColor, 不含可变车牌号)
             return null;
 
         int offset = 0;
@@ -236,49 +237,50 @@ public static class JT808Decoder
     }
 
     /// <summary>
-    /// 反转义
+    /// 反转义 — 原地写入 (写指针 ≤ 读指针, 因为 unescape 只会缩短不会扩张)
+    /// 返回新的有效长度, 调用方根据 length 取前 N 字节即可
     /// </summary>
-    private static byte[] Unescape(byte[] data)
+    private static int UnescapeInPlace(byte[] data, int length)
     {
-        var result = new List<byte>();
-        for (int i = 0; i < data.Length; i++)
+        int w = 0;
+        for (int r = 0; r < length; r++)
         {
-            if (data[i] == JT808Constants.ESCAPE && i + 1 < data.Length)
+            byte b = data[r];
+            if (b == JT808Constants.ESCAPE && r + 1 < length)
             {
-                if (data[i + 1] == JT808Constants.ESCAPE_7E)
+                byte next = data[r + 1];
+                if (next == JT808Constants.ESCAPE_7E)
                 {
-                    result.Add(JT808Constants.FLAG);
-                    i++;
+                    data[w++] = JT808Constants.FLAG;
+                    r++;
                 }
-                else if (data[i + 1] == JT808Constants.ESCAPE_7D)
+                else if (next == JT808Constants.ESCAPE_7D)
                 {
-                    result.Add(JT808Constants.ESCAPE);
-                    i++;
+                    data[w++] = JT808Constants.ESCAPE;
+                    r++;
                 }
                 else
                 {
-                    result.Add(data[i]);
+                    data[w++] = b;
                 }
             }
             else
             {
-                result.Add(data[i]);
+                data[w++] = b;
             }
         }
-        return result.ToArray();
+        return w;
     }
 
     /// <summary>
-    /// 校验码验证
+    /// 校验码验证 (XOR 0..length-2 与 data[length-1] 比较)
     /// </summary>
-    private static bool VerifyCheckCode(byte[] data)
+    private static bool VerifyCheckCode(byte[] data, int length)
     {
-        if (data.Length < 2)
-            return false;
-
-        byte checkCode = data[^1];
+        if (length < 2) return false;
+        byte checkCode = data[length - 1];
         byte calculated = 0;
-        for (int i = 0; i < data.Length - 1; i++)
+        for (int i = 0; i < length - 1; i++)
         {
             calculated ^= data[i];
         }

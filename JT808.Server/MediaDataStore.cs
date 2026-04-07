@@ -75,7 +75,7 @@ public class MediaPackageCache
 /// <summary>
 /// 多媒体数据存储器 - 支持分包组装、漏包重传、首包延迟到达
 /// </summary>
-public class MediaDataStore
+public class MediaDataStore : IDisposable
 {
     private readonly string _dataDirectory;
     private readonly object _saveLockObj = new();
@@ -85,6 +85,8 @@ public class MediaDataStore
 
     private const int CacheTimeoutMinutes = 10;
 
+    private readonly CancellationTokenSource _cts = new();
+
     public MediaDataStore(string dataDirectory = "MediaData")
     {
         _dataDirectory = dataDirectory;
@@ -93,7 +95,13 @@ public class MediaDataStore
             Directory.CreateDirectory(_dataDirectory);
         }
 
-        Task.Run(CleanupCacheTask);
+        _ = Task.Run(() => CleanupCacheTask(_cts.Token));
+    }
+
+    public void Dispose()
+    {
+        try { _cts.Cancel(); } catch { }
+        try { _cts.Dispose(); } catch { }
     }
 
     /// <summary>
@@ -315,25 +323,28 @@ public class MediaDataStore
     private static string MakeCacheKey(string phone, ushort firstSerial) => $"{phone}_{firstSerial}";
 
     /// <summary>
-    /// 标准化手机号为12位
+    /// 标准化手机号为12位 (长的截取末尾 12 位防异常长串)
     /// </summary>
     private static string NormalizePhoneNumber(string phoneNumber)
     {
+        if (string.IsNullOrEmpty(phoneNumber)) return "000000000000";
         var trimmed = phoneNumber.TrimStart('0');
         if (string.IsNullOrEmpty(trimmed)) return "000000000000";
+        if (trimmed.Length > 12)
+            trimmed = trimmed.Substring(trimmed.Length - 12);
         return trimmed.PadLeft(12, '0');
     }
 
     /// <summary>
-    /// 清理超时缓存
+    /// 清理超时缓存 — 支持 cancellation, Dispose() 后能优雅退出
     /// </summary>
-    private async Task CleanupCacheTask()
+    private async Task CleanupCacheTask(CancellationToken token)
     {
-        while (true)
+        while (!token.IsCancellationRequested)
         {
             try
             {
-                await Task.Delay(TimeSpan.FromMinutes(1));
+                await Task.Delay(TimeSpan.FromMinutes(1), token).ConfigureAwait(false);
                 var expiredKeys = _packageCache
                     .Where(kv => (DateTime.Now - kv.Value.LastUpdateTime).TotalMinutes > CacheTimeoutMinutes)
                     .Select(kv => kv.Key)
@@ -344,6 +355,7 @@ public class MediaDataStore
                     _packageCache.TryRemove(key, out _);
                 }
             }
+            catch (OperationCanceledException) { return; }
             catch
             {
                 // 忽略清理错误

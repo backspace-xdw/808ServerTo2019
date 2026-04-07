@@ -49,11 +49,15 @@ public class LocationDataStore : IAsyncDisposable
             Directory.CreateDirectory(_archiveDirectory);
         }
 
-        _notifyChannel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
+        // Bounded + DropOldest: 写盘卡顿时丢弃旧通知 (数据本身在 _pending 字典里, 通知只是唤醒 worker
+        // 的信号, 通知重复或丢失不影响正确性, _pending 里 key 数自然有上限 = 在线终端数)
+        // 容量 50000 远大于 10K 终端并发上报数, 正常永远不会触发 DropOldest
+        _notifyChannel = Channel.CreateBounded<string>(new BoundedChannelOptions(50000)
         {
             SingleReader = true,
             SingleWriter = false,
             AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.DropOldest,
         });
 
         _worker = Task.Run(WriteLoopAsync);
@@ -151,11 +155,15 @@ public class LocationDataStore : IAsyncDisposable
 
     /// <summary>
     /// 标准化手机号为12位
+    /// 短的左侧补 0; 长的取末尾 12 位 (防异常长字符串当文件名)
     /// </summary>
     private static string NormalizePhoneNumber(string phoneNumber)
     {
+        if (string.IsNullOrEmpty(phoneNumber)) return "000000000000";
         var trimmed = phoneNumber.TrimStart('0');
         if (string.IsNullOrEmpty(trimmed)) return "000000000000";
+        if (trimmed.Length > 12)
+            trimmed = trimmed.Substring(trimmed.Length - 12);
         return trimmed.PadLeft(12, '0');
     }
 

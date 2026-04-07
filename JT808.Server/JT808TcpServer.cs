@@ -36,8 +36,6 @@ public class JT808TcpServer
     // 每个 session 的接收缓冲区大小
     private const int ReceiveBufferSize = 4096;
 
-    private static readonly ArrayPool<byte> BufferPool = ArrayPool<byte>.Shared;
-
     public JT808TcpServer(
         ILogger<JT808TcpServer> logger,
         string ipAddress = "0.0.0.0",
@@ -227,8 +225,8 @@ public class JT808TcpServer
     {
         try
         {
-            // 租用复用的 buffer 和 SAEA
-            var buffer = BufferPool.Rent(ReceiveBufferSize);
+            // 租用复用的 buffer 和 SAEA (Buffer 在 SessionManager.RemoveSession 中归还)
+            var buffer = ArrayPool<byte>.Shared.Rent(ReceiveBufferSize);
             var args = new SocketAsyncEventArgs();
             args.UserToken = session;
             args.SetBuffer(buffer, 0, buffer.Length);
@@ -353,6 +351,9 @@ public class JT808TcpServer
         }
     }
 
+    // 连续解码失败超过此次数 → 视为恶意/坏客户端, 强制断开
+    private const int MaxConsecutiveDecodeErrors = 16;
+
     // ============================================================
     //                          MESSAGE PROCESSING
     // ============================================================
@@ -363,10 +364,18 @@ public class JT808TcpServer
             var message = JT808Decoder.Decode(data);
             if (message == null)
             {
+                int errors = session.IncDecodeErrors();
                 if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug("消息解码失败 Sid={Sid}", session.SessionId);
+                    _logger.LogDebug("消息解码失败 Sid={Sid} 累计={Err}", session.SessionId, errors);
+                if (errors >= MaxConsecutiveDecodeErrors)
+                {
+                    _logger.LogWarning("Sid={Sid} 连续解码错误 {Err} 次, 强制断开", session.SessionId, errors);
+                    _sessionManager.RemoveSession(session.SessionId);
+                }
                 return;
             }
+            // 收到正确消息 → 重置错误计数
+            session.ResetDecodeErrors();
 
             // 检测协议版本 (仅状态变化时打日志)
             if (message.Header.Is2019Version && !session.Is2019Version)
@@ -608,11 +617,26 @@ public class JT808TcpServer
     //                          SEND
     // ============================================================
     /// <summary>
-    /// 同步发送 + per-session 串行锁
-    /// JT808 应答包很小 (<100 字节), 内核 send buffer 会立即吸收, sync send 完全够用
-    /// SendTimeout=5s 作为慢客户端的兜底
+    /// 发送数据 — 立刻返回, 实际发送在 ThreadPool 工作线程上跑
+    /// 这样 IOCP 线程不会被慢客户端的 sync Send 阻塞,
+    /// per-session SendLock 仍然保证同一 socket 的发送顺序
     /// </summary>
     private void SendData(SessionInfo session, byte[] data)
+    {
+        if (session.IsClosed) return;
+        ThreadPool.UnsafeQueueUserWorkItem(static state =>
+        {
+            var (server, sess, payload) = state;
+            server.SendDataSync(sess, payload);
+        }, (this, session, data), preferLocal: false);
+    }
+
+    /// <summary>
+    /// per-session 串行锁内的同步发送
+    /// JT808 应答包很小 (&lt;100 字节), 内核 send buffer 会立即吸收
+    /// SendTimeout=5s 是慢客户端兜底; 超时即抛, 触发会话关闭
+    /// </summary>
+    private void SendDataSync(SessionInfo session, byte[] data)
     {
         if (session.IsClosed) return;
 

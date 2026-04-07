@@ -33,10 +33,20 @@ public class SessionInfo
     public void IncReceived() => Interlocked.Increment(ref _receivedMessages);
     public void IncSent() => Interlocked.Increment(ref _sentMessages);
 
+    /// <summary>
+    /// 连续解码错误计数 (恶意/坏客户端识别). 收到正确消息后归零
+    /// </summary>
+    private int _decodeErrors;
+    public int DecodeErrors => Volatile.Read(ref _decodeErrors);
+    public int IncDecodeErrors() => Interlocked.Increment(ref _decodeErrors);
+    public void ResetDecodeErrors() => Interlocked.Exchange(ref _decodeErrors, 0);
+
     public JT808MessageBuffer MessageBuffer { get; } = new JT808MessageBuffer();
 
-    // 2019版本特有信息
-    public bool Is2019Version { get; set; } = true;
+    // 2019 版本特有信息
+    // 默认 false (2013), 收到第一条 2019 消息时由 ProcessMessage 翻转为 true
+    // 这样 2013 客户端的应答会用 2013 格式 (默认 true 会导致 2013 客户端被回 2019 格式)
+    public bool Is2019Version { get; set; } = false;
     public byte ProtocolVersion { get; set; } = 0x01;
     public string? IMEI { get; set; }
     public string? SoftwareVersion { get; set; }
